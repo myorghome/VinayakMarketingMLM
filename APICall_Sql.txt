@@ -1,0 +1,178 @@
+USE [NJRHS_Production_QA]
+GO
+/****** Object:  StoredProcedure [dbo].[spCIS_CommonFrameworkGet]    Script Date: 9/13/2019 12:56:30 PM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+/*
+********************************************************************************************  
+** Description  : This is a common SP which will get call from individual SPs. It will get JSON value and convert that to XML.
+** Parameters   : @Url,@MethodName,@CISInput,@Xml
+** Input		: Url of API, its method name along with method parameters.
+** Output		: Converted XML
+** Internal Called: This SP will get call from the Individual SPs of Lead Status, Lead Type, Lead Source, Leads and Customer.
+ 
+** Auth   : Krishnapal Singh Panwar
+** Date   : 14-01-2016(dd-mm-yyyy)
+**********************************************************************************************
+As this SP will call internally by individual SPs hence no Sample required.
+**********************************************************************************************
+ */
+ALTER PROCEDURE [dbo].[spCIS_CommonFrameworkGet] (
+@ExtendedURL VARCHAR(200),
+@APIId INT,
+@Xml XML OUTPUT)
+AS
+BEGIN
+	-- SET NOCOUNT ON added to prevent extra result sets from
+	-- interfering with SELECT statements.
+	SET NOCOUNT ON;
+	--variable declaration	
+	DECLARE @Object INT
+	DECLARE @HResult INT
+	DECLARE @ResponseText VARCHAR(MAX)
+	DECLARE @Status AS INT;
+	DECLARE @Text XML
+	DECLARE @NvarcharResponse NVARCHAR(MAX)
+	DECLARE @ResponseVarchar VARCHAR(MAX)
+	DECLARE @IsTestModeOn BIT
+	DECLARE @Url VARCHAR(200)
+	DECLARE @Pos INT
+	DECLARE @FetchValue VARCHAR(MAX),  @tab char(1)=CHAR(9), @cr char(1)=CHAR(13), @lf char(1)=CHAR(10)
+
+	BEGIN TRY
+		SELECT TOP 1 @Url = [CISWebServiceURL] FROM [dbo].[SystemConfigs] ORDER BY [CISWebServiceURL] ASC
+
+		SET @Url = @Url + @ExtendedURL
+
+		IF OBJECT_ID('tempdb..#FetchXML') IS NOT NULL DROP TABLE #FetchXML
+		CREATE TABLE #FetchXML (
+		Response NVarchar(MAX)
+		)
+  
+		SELECT TOP 1 @IsTestModeOn = [IsTestModeCIS] FROM [dbo].[SystemConfigs] ORDER BY [IsTestModeCIS] ASC
+		
+		--Checking IsTestModeOn value from SystemConfigs table and if it is 1 then fetching JSON value from CISCalls table
+		IF @IsTestModeOn = 1
+			BEGIN				
+				SELECT @ResponseVarchar = [JSONResponse] FROM [dbo].[CISCalls] WHERE APIId = @APIId		 						
+			END
+		--If IsTestModeOn value is not 1 then call API to fetch JSON value
+		ELSE
+			BEGIN
+				EXEC @HResult = sp_OACreate 'WinHttp.WinHttpRequest.5.1', @Object OUT
+				IF @HResult <> 0 EXEC sp_OAGetErrorInfo @Object --If @HResult value is not zero (0) it means there is error in our call
+
+				--set the timeouts      
+				EXEC @HResult = sp_OAMethod @Object, 'setTimeouts(900000, 900000, 900000, 900000)'
+
+				EXEC @HResult = sp_OAMethod @Object,'Open',NULL,'GET',@Url,'false'
+				IF @HResult <> 0 EXEC sp_OAGetErrorInfo @Object
+
+				EXEC @HResult = sp_OAMethod @Object,'Send'
+				EXEC @HResult = sp_OAMethod @Object, 'responseText', @ResponseText OUTPUT
+				EXEC @HResult = sp_OAMethod @Object, 'status', @Status OUTPUT
+				--IF @HResult <> 0 EXEC sp_OAGetErrorInfo @Object
+
+				--Checking the value of @HResult and if it is not zero
+				--IF @HResult <> 0 				
+				--	THROW 50002, 'CIS Connection Failure. Please retry your transaction again later.',1
+
+				--This will insert value to the temp table Test
+				INSERT #FetchXML
+				EXEC @HResult = sp_OAGetProperty @Object,'ResponseText' 
+				--IF @HResult <> 0 EXEC sp_OAGetErrorInfo @Object
+				SELECT @ResponseVarchar = Convert(NVARCHAR(MAx),Response) FROM #FetchXML
+
+
+				IF @Status = 500  OR (@Status IS NULL OR @Status <= 0)
+				BEGIN
+				--This will insert value to the temp table Test
+						IF LOWER(@ResponseVarchar) LIKE '%cis connection%'
+						BEGIN							
+							THROW 50002, 'CIS Connection Failure. Please retry your transaction again later.' ,1;
+						END
+						ELSE IF  (@Status IS NULL OR  @Status <= 0)
+						BEGIN
+							THROW 50002, 'Web Server is not accessible.Please retry your transaction again later.',1	;
+						END
+						ELSE IF (@ResponseVarchar IS NULL OR @ResponseVarchar ='')
+						BEGIN
+							THROW 50001, 'Issue in web service',1;
+						END
+						ELSE
+						BEGIN
+							THROW 50001, @ResponseVarchar,1;
+						END
+				END
+				ELSE IF @Status <> 200
+						  THROW 50001, 'Issue in web service',1;		
+
+
+				/*Assigning value to ResponseVarchar variable, it is required to assign value to ResponseVarchar variable
+				as we need to replace special characters like &, > with there binary values otherwise they will throw error at time of explicit XML conversion*/
+				--SELECT @ResponseVarchar = Response FROM #FetchXML
+				SELECT @ResponseVarchar = Convert(NVARCHAR(MAx),Response) FROM #FetchXML
+			END
+
+		SET @ResponseVarchar = REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@ResponseVarchar, '&', '&amp;'), '>', '&gt;'), '<', '&lt;'), '"', '&quot;'), '''', '&apos;')
+
+		--Inserting ResponseVarchar value into Temp table
+		--INSERT #FetchXML SELECT @ResponseVarchar
+
+		IF @IsTestModeOn <> 1
+			BEGIN
+				EXEC @HResult = sp_OADestroy @Object
+				IF @HResult <> 0 EXEC sp_OAGetErrorInfo @Object								
+			END
+
+		--Changes for checking the fethed data is not empty, if yes then throw an error to UI
+		IF LEN(@ResponseVarchar) > 0
+		BEGIN
+			SET @FetchValue = LTRIM(RTRIM(
+			REPLACE(REPLACE(REPLACE(REPLACE(@ResponseVarchar, @cr, ''), @lf, ''), @tab, ''),' "','"')))
+			SELECT @Pos=PATINDEX('%:%',@FetchValue)
+			IF @Pos <> 0
+			SELECT @Pos=PATINDEX('%:%',SUBSTRING(@FetchValue,@Pos + 1,LEN(@FetchValue)))
+		END
+		IF @Pos = 0
+			THROW 59999,'No Records have been fetched from CIS',1
+
+		
+		--SELECT @Text = Response FROM #FetchXML
+		SELECT @Text = @ResponseVarchar
+  
+		SELECT @NvarcharResponse = CAST(@Text AS NVARCHAR(MAX));
+
+		--Converting XML to JSON
+		SELECT @Xml = dbo.fn_parse_json2xml(@NvarcharResponse)
+
+		--Creating Root Node
+		DECLARE @ParentXML XML = '<njrhs>
+		</njrhs>'
+
+		--Inserting XML values in between to Root Nodes
+		SET @ParentXML.modify('insert sql:variable("@Xml") as last into /njrhs[1]')
+
+		--Assigning value to @Xml
+		SET @Xml = @ParentXML
+
+	END TRY
+	BEGIN CATCH 
+		INSERT INTO [dbo].[ErrorLog]
+           ([Type]
+           ,[DateTime]
+           ,[ObjectName]
+           ,[OtherDetails]
+           ,[ErrorText])
+		VALUES
+		   ('CISErrorLog'
+		   ,GETDATE()
+		   ,'spCIS_CommonFrameworkGet'
+		   ,@ExtendedURL
+		   ,(SELECT ERROR_MESSAGE()));
+		   
+		THROW;
+	END CATCH 	
+END
